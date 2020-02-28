@@ -7,8 +7,7 @@
  *      INCLUDES
  *********************/
 #include "lv_conf.h"
-#include "lvgl/lv_core/lv_vdb.h"
-#include "lvgl/lv_hal/lv_hal.h"
+#include "lvgl/lvgl.h"
 #include <string.h>
 
 #include "tft.h"
@@ -60,12 +59,11 @@
  **********************/
 
 /*These 3 functions are needed by LittlevGL*/
-static void tft_fill(int32_t x1, int32_t y1, int32_t x2, int32_t y2, lv_color_t color);
-static void tft_map(int32_t x1, int32_t y1, int32_t x2, int32_t y2, const lv_color_t * color_p);
-static void tft_flush(int32_t x1, int32_t y1, int32_t x2, int32_t y2, const lv_color_t * color_p);
+static void tft_flush(lv_disp_drv_t * drv, const lv_area_t * area, lv_color_t * color_p);
 #if TFT_USE_GPU != 0
-static void gpu_mem_blend(lv_color_t * dest, const lv_color_t * src, uint32_t length, lv_opa_t opa);
-static void gpu_mem_fill(lv_color_t * dest, uint32_t length, lv_color_t color);
+static void gpu_mem_blend(lv_disp_drv_t * drv, lv_color_t * dest, const lv_color_t * src, uint32_t length, lv_opa_t opa);
+static void gpu_mem_fill(lv_disp_drv_t * disp_drv, lv_color_t * dest_buf, lv_coord_t dest_width,
+        const lv_area_t * fill_area, lv_color_t color);
 #endif
 
 /*LCD*/
@@ -109,6 +107,7 @@ static uint16_t my_fb[TFT_HOR_RES * TFT_VER_RES];
 
 
 DMA_HandleTypeDef     DmaHandle;
+static lv_disp_drv_t disp_drv;
 static int32_t x1_flush;
 static int32_t y1_flush;
 static int32_t x2_flush;
@@ -124,12 +123,21 @@ static const lv_color_t * buf_to_flush;
  *   GLOBAL FUNCTIONS
  **********************/
 
+static volatile uint32_t t_saved = 0;
+void monitor_cb(lv_disp_drv_t * d, uint32_t t, uint32_t p)
+{
+	t_saved = t;
+}
+
 /**
  * Initialize your display here
  */
 void tft_init(void)
 {
-	lv_disp_drv_t disp_drv;
+	static lv_color_t disp_buf1[TFT_HOR_RES * 40];
+	static lv_disp_buf_t buf;
+	lv_disp_buf_init(&buf, disp_buf1, NULL, TFT_HOR_RES * 40);
+
 	lv_disp_drv_init(&disp_drv);
 
 #if TFT_EXT_FB != 0
@@ -137,14 +145,13 @@ void tft_init(void)
 #endif
 	LCD_Config();
 	DMA_Config();
-
-	disp_drv.disp_fill = tft_fill;
-	disp_drv.disp_map = tft_map;
-	disp_drv.disp_flush = tft_flush;
+	disp_drv.buffer = &buf;
+	disp_drv.flush_cb = tft_flush;
+	disp_drv.monitor_cb = monitor_cb;
 #if TFT_USE_GPU != 0
 	DMA2D_Config();
-	disp_drv.mem_blend = gpu_mem_blend;
-	disp_drv.mem_fill = gpu_mem_fill;
+	disp_drv.gpu_blend_cb = gpu_mem_blend;
+	disp_drv.gpu_fill_cb = gpu_mem_fill;
 #endif
 	lv_disp_drv_register(&disp_drv);
 }
@@ -161,19 +168,19 @@ void tft_init(void)
  * @param y2 bottom coordinate of the rectangle
  * @param color_p pointer to an array of colors
  */
-static void tft_flush(int32_t x1, int32_t y1, int32_t x2, int32_t y2, const lv_color_t * color_p)
+static void tft_flush(lv_disp_drv_t * drv, const lv_area_t * area, lv_color_t * color_p)
 {
 	/*Return if the area is out the screen*/
-	if(x2 < 0) return;
-	if(y2 < 0) return;
-	if(x1 > TFT_HOR_RES - 1) return;
-	if(y1 > TFT_VER_RES - 1) return;
+	if(area->x2 < 0) return;
+	if(area->y2 < 0) return;
+	if(area->x1 > TFT_HOR_RES - 1) return;
+	if(area->y1 > TFT_VER_RES - 1) return;
 
 	/*Truncate the area to the screen*/
-	int32_t act_x1 = x1 < 0 ? 0 : x1;
-	int32_t act_y1 = y1 < 0 ? 0 : y1;
-	int32_t act_x2 = x2 > TFT_HOR_RES - 1 ? TFT_HOR_RES - 1 : x2;
-	int32_t act_y2 = y2 > TFT_VER_RES - 1 ? TFT_VER_RES - 1 : y2;
+	int32_t act_x1 = area->x1 < 0 ? 0 : area->x1;
+	int32_t act_y1 = area->y1 < 0 ? 0 : area->y1;
+	int32_t act_x2 = area->x2 > TFT_HOR_RES - 1 ? TFT_HOR_RES - 1 : area->x2;
+	int32_t act_y2 = area->y2 > TFT_VER_RES - 1 ? TFT_VER_RES - 1 : area->y2;
 
 	x1_flush = act_x1;
 	y1_flush = act_y1;
@@ -195,94 +202,6 @@ static void tft_flush(int32_t x1, int32_t y1, int32_t x2, int32_t y2, const lv_c
 	}
 }
 
-/**
- * Fill a rectangular area with a color
- * @param x1 left coordinate of the rectangle
- * @param x2 right coordinate of the rectangle
- * @param y1 top coordinate of the rectangle
- * @param y2 bottom coordinate of the rectangle
- * @param color fill color
- */
-static void tft_fill(int32_t x1, int32_t y1, int32_t x2, int32_t y2, lv_color_t color)
-{
-    /*Return if the area is out the screen*/
-    if(x2 < 0) return;
-    if(y2 < 0) return;
-    if(x1 > TFT_HOR_RES - 1) return;
-    if(y1 > TFT_VER_RES - 1) return;
-
-    /*Truncate the area to the screen*/
-    int32_t act_x1 = x1 < 0 ? 0 : x1;
-    int32_t act_y1 = y1 < 0 ? 0 : y1;
-    int32_t act_x2 = x2 > TFT_HOR_RES - 1 ? TFT_HOR_RES - 1 : x2;
-    int32_t act_y2 = y2 > TFT_VER_RES - 1 ? TFT_VER_RES - 1 : y2;
-
-	uint32_t x;
-	uint32_t y;
-
-	/*Fill the remaining area*/
-	for(x = act_x1; x <= act_x2; x++) {
-		for(y = act_y1; y <= act_y2; y++) {
-			my_fb[y * TFT_HOR_RES + x] = color.full;
-		}
-	}
-}
-
-
-/**
- * Put a color map to a rectangular area
- * @param x1 left coordinate of the rectangle
- * @param x2 right coordinate of the rectangle
- * @param y1 top coordinate of the rectangle
- * @param y2 bottom coordinate of the rectangle
- * @param color_p pointer to an array of colors
- */
-static void tft_map(int32_t x1, int32_t y1, int32_t x2, int32_t y2, const lv_color_t * color_p)
-{
-	/*Return if the area is out the screen*/
-	if(x2 < 0) return;
-	if(y2 < 0) return;
-	if(x1 > TFT_HOR_RES - 1) return;
-	if(y1 > TFT_VER_RES - 1) return;
-
-	/*Truncate the area to the screen*/
-	int32_t act_x1 = x1 < 0 ? 0 : x1;
-	int32_t act_y1 = y1 < 0 ? 0 : y1;
-	int32_t act_x2 = x2 > TFT_HOR_RES - 1 ? TFT_HOR_RES - 1 : x2;
-	int32_t act_y2 = y2 > TFT_VER_RES - 1 ? TFT_VER_RES - 1 : y2;
-
-#if LV_VDB_DOUBLE == 0
-	uint32_t y;
-	for(y = act_y1; y <= act_y2; y++) {
-		memcpy((void*)&my_fb[y * TFT_HOR_RES + act_x1],
-				color_p,
-				(act_x2 - act_x1 + 1) * sizeof(my_fb[0]));
-		color_p += x2 - x1 + 1;    /*Skip the parts out of the screen*/
-	}
-#else
-
-	x1_flush = act_x1;
-	y1_flush = act_y1;
-	x2_flush = act_x2;
-	y2_fill = act_y2;
-	y_fill_act = act_y1;
-	buf_to_flush = color_p;
-
-
-	  /*##-7- Start the DMA transfer using the interrupt mode #*/
-	  /* Configure the source, destination and buffer size DMA fields and Start DMA Stream transfer */
-	  /* Enable All the DMA interrupts */
-	  if(HAL_DMA_Start_IT(&DmaHandle,(uint32_t)buf_to_flush, (uint32_t)&my_fb[y_fill_act * TFT_HOR_RES + x1_flush],
-						  (x2_flush - x1_flush + 1)) != HAL_OK)
-	  {
-	    while(1)
-	    {
-	    }
-	  }
-
-#endif
-}
-
 
 #if TFT_USE_GPU != 0
 
@@ -293,7 +212,7 @@ static void tft_map(int32_t x1, int32_t y1, int32_t x2, int32_t y2, const lv_col
  * @param length number of pixels in 'src'
  * @param opa opacity (0, OPA_TRANSP: transparent ... 255, OPA_COVER, fully cover)
  */
-static void gpu_mem_blend(lv_color_t * dest, const lv_color_t * src, uint32_t length, lv_opa_t opa)
+static void gpu_mem_blend(lv_disp_drv_t * drv, lv_color_t * dest, const lv_color_t * src, uint32_t length, lv_opa_t opa)
 {
 	/*Wait for the previous operation*/
 	HAL_DMA2D_PollForTransfer(&Dma2dHandle, 100);
@@ -310,14 +229,8 @@ static void gpu_mem_blend(lv_color_t * dest, const lv_color_t * src, uint32_t le
 	HAL_DMA2D_BlendingStart(&Dma2dHandle, (uint32_t) src, (uint32_t) dest, (uint32_t)dest, length, 1);
 }
 
-/**
- * Copy pixels to destination memory using opacity
- * @param dest a memory address. Copy 'src' here.
- * @param src pointer to pixel map. Copy it to 'dest'.
- * @param length number of pixels in 'src'
- * @param opa opacity (0, OPA_TRANSP: transparent ... 255, OPA_COVER, fully cover)
- */
-static void gpu_mem_fill(lv_color_t * dest, uint32_t length, lv_color_t color)
+static void gpu_mem_fill(lv_disp_drv_t * disp_drv, lv_color_t * dest_buf, lv_coord_t dest_width,
+        const lv_area_t * fill_area, lv_color_t color)
 {
 	/*Wait for the previous operation*/
 	HAL_DMA2D_PollForTransfer(&Dma2dHandle, 100);
@@ -330,10 +243,22 @@ static void gpu_mem_fill(lv_color_t * dest, uint32_t length, lv_color_t color)
      while(1);
    }
 
+   Dma2dHandle.LayerCfg[1].InputAlpha = 0xff;
+   HAL_DMA2D_ConfigLayer(&Dma2dHandle, 1);
 
-	Dma2dHandle.LayerCfg[1].InputAlpha = 0xff;
-    HAL_DMA2D_ConfigLayer(&Dma2dHandle, 1);
-	HAL_DMA2D_BlendingStart(&Dma2dHandle, (uint32_t) lv_color_to32(color), (uint32_t) dest, (uint32_t)dest, length, 1);
+   lv_color_t * dest_buf_ofs = dest_buf;
+
+   dest_buf_ofs += dest_width * fill_area->y1;
+   dest_buf_ofs += fill_area->x1;
+   lv_coord_t area_w = lv_area_get_width(fill_area);
+
+   uint32_t i;
+   for(i = fill_area->y1; i <= fill_area->y2; i++) {
+	   /*Wait for the previous operation*/
+	   HAL_DMA2D_PollForTransfer(&Dma2dHandle, 100);
+	   HAL_DMA2D_BlendingStart(&Dma2dHandle, (uint32_t) lv_color_to32(color), (uint32_t) dest_buf_ofs, (uint32_t)dest_buf_ofs, area_w, 1);
+	   dest_buf_ofs += dest_width;
+   }
 }
 
 #endif
@@ -379,13 +304,13 @@ static void LCD_Config(void)
   /* Accumulated vertical back porch = Vsync + VBP - 1 */
   LtdcHandle.Init.AccumulatedVBP = 3;
   /* Accumulated active width = Hsync + HBP + Active Width - 1 */
-  LtdcHandle.Init.AccumulatedActiveH = 323;
-  /* Accumulated active height = Vsync + VBP + Active Heigh - 1 */
   LtdcHandle.Init.AccumulatedActiveW = 269;
-  /* Total height = Vsync + VBP + Active Heigh + VFP - 1 */
-  LtdcHandle.Init.TotalHeigh = 327;
+  /* Accumulated active height = Vsync + VBP + Active Heigh - 1 */
+  LtdcHandle.Init.AccumulatedActiveH = 323;
   /* Total width = Hsync + HBP + Active Width + HFP - 1 */
   LtdcHandle.Init.TotalWidth = 279;
+  /* Total height = Vsync + VBP + Active Heigh + VFP - 1 */
+  LtdcHandle.Init.TotalHeigh = 327;
 
   /* Configure R,G,B component values for LCD background color */
   LtdcHandle.Init.Backcolor.Blue = 0;
@@ -911,7 +836,7 @@ static void DMA_Config(void)
   DmaHandle.Init.PeriphInc = DMA_PINC_ENABLE;               /* Peripheral increment mode Enable */
   DmaHandle.Init.MemInc = DMA_MINC_ENABLE;                  /* Memory increment mode Enable     */
   DmaHandle.Init.PeriphDataAlignment = DMA_PDATAALIGN_HALFWORD; /* Peripheral data alignment : 16bit */
-  DmaHandle.Init.MemDataAlignment = DMA_PDATAALIGN_HALFWORD;    /* memory data alignment : 16bit     */
+  DmaHandle.Init.MemDataAlignment = DMA_MDATAALIGN_HALFWORD;    /* memory data alignment : 16bit     */
   DmaHandle.Init.Mode = DMA_NORMAL;                         /* Normal DMA mode                  */
   DmaHandle.Init.Priority = DMA_PRIORITY_HIGH;              /* priority level : high            */
   DmaHandle.Init.FIFOMode = DMA_FIFOMODE_ENABLE;            /* FIFO mode enabled                */
@@ -948,7 +873,7 @@ static void DMA_TransferComplete(DMA_HandleTypeDef *han)
 	y_fill_act ++;
 
 	if(y_fill_act > y2_fill) {
-		  lv_flush_ready();
+		  lv_disp_flush_ready(&disp_drv);
 	} else {
 	  buf_to_flush += x2_flush - x1_flush + 1;
 	  /*##-7- Start the DMA transfer using the interrupt mode ####################*/
